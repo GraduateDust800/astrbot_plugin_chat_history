@@ -1,0 +1,5 @@
+name: chat_history_injector
+author: GraduateDust800
+description: 自动存储聊天记录并注入LLM提示词的插件
+version: 1.0.0
+repo: https://github.com/GraduateDust800/astrbot_plugin_chat_history

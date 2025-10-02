@@ -1,0 +1,8 @@
+{
+  "history_count": {
+    "description": "保存的历史记录条数",
+    "type": "integer",
+    "default": 5,
+    "hint": "设置需要注入到提示词中的历史记录数量"
+  }
+}

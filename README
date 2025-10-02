@@ -1,0 +1,149 @@
+# 聊天记录存储与提示词注入插件设计
+
+## 插件概述
+本插件旨在实现自动监听聊天记录，以JSON格式存储，并在LLM请求时自动注入历史对话上下文，无需Bot主动请求即可触发。
+
+## 核心功能
+1. **自动消息监听**：实时捕获所有聊天消息并存储
+2. **JSON格式存储**：按会话ID组织历史记录
+3. **提示词自动注入**：在LLM请求前追加格式化的历史对话
+4. **可配置历史条数**：允许用户自定义注入的历史记录数量
+
+## 实现方案
+
+### 1. 插件结构设计
+```python
+from astrbot.api.event import filter, AstrMessageEvent, EventMessageType
+from astrbot.api.star import Context, Star, register
+from astrbot.api import logger
+import json
+import os
+from datetime import datetime
+
+@register("chat_history_injector", "开发者", "聊天记录存储与提示词注入插件", "1.0.0", "https://github.com/yourrepo")
+class ChatHistoryInjector(Star):
+    def __init__(self, context: Context):
+        super().__init__(context)
+        # 初始化数据存储目录
+        self.data_dir = os.path.join("data", "chat_history")
+        os.makedirs(self.data_dir, exist_ok=True)
+        # 从配置获取历史记录数量，默认为5
+        self.history_count = self.config.get("history_count", 5)
+        
+    # 事件监听：保存所有消息到JSON
+    @filter.event_message_type(EventMessageType.ALL)
+    async def on_all_message(self, event: AstrMessageEvent):
+        # 获取会话唯一标识
+        session_id = event.unified_msg_origin
+        # 构建消息数据结构
+        message_data = {
+            "message_id": event.message_obj.message_id,
+            "sender_id": event.get_sender_id(),
+            "sender_name": event.get_sender_name(),
+            "timestamp": event.message_obj.timestamp,
+            "content": event.message_str,
+            "message_type": "group" if event.is_group_chat() else "private"
+        }
+        
+        # 保存到JSON文件
+        file_path = os.path.join(self.data_dir, f"{session_id}.json")
+        try:
+            if os.path.exists(file_path):
+                with open(file_path, "r", encoding="utf-8") as f:
+                    history = json.load(f)
+            else:
+                history = []
+            
+            # 保持最新的N条记录
+            history.append(message_data)
+            if len(history) > self.history_count:
+                history = history[-self.history_count:]
+                
+            with open(file_path, "w", encoding="utf-8") as f:
+                json.dump(history, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.error(f"保存聊天记录失败: {str(e)}")
+    
+    # LLM请求钩子：注入历史记录
+    @filter.on_llm_request()
+    async def inject_history_to_llm(self, event: AstrMessageEvent, req: ProviderRequest):
+        # 获取当前会话ID
+        session_id = event.unified_msg_origin
+        file_path = os.path.join(self.data_dir, f"{session_id}.json")
+        
+        try:
+            if os.path.exists(file_path):
+                with open(file_path, "r", encoding="utf-8") as f:
+                    history = json.load(f)
+                
+                # 格式化为用户要求的纯文本格式
+                history_text = "这是前 {num} 条历史记录：\n".format(num=len(history))
+                for i, msg in enumerate(history, 1):
+                    history_text += f"{i}. {msg['sender_name']}: {msg['content']}\n"
+                
+                # 添加最新消息
+                history_text += "这是刚刚获取到的消息：\n{message}".format(
+                    message=event.message_str
+                )
+                
+                # 注入到system_prompt或contexts
+                if req.system_prompt:
+                    req.system_prompt += "\n\n" + history_text
+                else:
+                    req.system_prompt = history_text
+                    
+                # 或者注入到contexts
+                # if not req.contexts:
+                #     req.contexts = []
+                # req.contexts.append({"role": "system", "content": history_text})
+                
+                logger.info(f"已注入{len(history)}条历史记录到LLM请求")
+        except Exception as e:
+            logger.error(f"注入历史记录失败: {str(e)}")
+    
+    async def terminate(self):
+        """插件停用前的清理工作"""
+        logger.info("聊天记录存储插件已停用")
+```
+
+### 2. 配置文件设计
+在插件目录下创建`_conf_schema.json`，允许用户配置历史记录数量：
+```json
+{
+  "history_count": {
+    "description": "保存的历史记录条数",
+    "type": "integer",
+    "default": 5,
+    "hint": "设置需要注入到提示词中的历史记录数量"
+  }
+}
+```
+
+### 3. 关键技术点说明
+1. **消息监听机制**：使用`@filter.event_message_type(EventMessageType.ALL)`监听所有消息事件，确保不遗漏任何对话内容。
+
+2. **数据持久化**：
+   - 使用会话唯一标识`unified_msg_origin`作为文件名
+   - 存储路径遵循文档建议放在`data`目录下
+   - 自动截断超出配置数量的历史记录
+
+3. **LLM请求注入**：
+   - 通过`@filter.on_llm_request()`钩子在LLM请求前介入
+   - 格式化历史记录为用户要求的纯文本格式
+   - 追加到system_prompt或注入到contexts中
+
+4. **用户可配置**：
+   - 通过配置文件允许用户自定义历史记录数量
+   - 符合AstrBot插件开发规范
+
+## 测试与部署
+1. 将插件代码放入`AstrBot/data/plugins/astrbot_plugin_chat_history`目录
+2. 在WebUI中启用插件并配置历史记录数量
+3. 进行多轮对话测试历史记录是否正确注入
+4. 检查JSON文件是否正确生成和更新
+
+## 可能的改进方向
+1. 添加历史记录加密功能保护隐私
+2. 支持按时间范围筛选历史记录
+3. 提供历史记录导出功能
+4. 增加对不同消息类型（图片、语音）的支持
